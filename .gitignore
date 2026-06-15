@@ -1,0 +1,12 @@
+# --- SECRETS: never commit these ---
+.env
+service_account.json
+
+# --- Runtime data (lives on your laptop / on the server's volume, not in git) ---
+todos.json
+memory.json
+*.tmp
+
+# --- Python junk ---
+__pycache__/
+*.pyc
