@@ -175,6 +175,28 @@ CANCEL_EVENT_TOOL = {
     },
 }
 
+REMOVE_TODO_TOOL = {
+    "name": "remove_todo",
+    "description": (
+        "Use when the user wants to REMOVE / COMPLETE / CHECK OFF / DELETE a TO-DO "
+        "(a task, NOT a calendar event), e.g. 'done with email housing', 'remove book "
+        "flights', 'check off the housing task', 'I finished the deck'. The system prompt "
+        "lists their open to-dos with ID numbers - set todo_id to the one they mean "
+        "(read the conversation to resolve 'it'/'that')."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "todo_id": {
+                "type": "integer",
+                "description": "Which to-do to remove, using the ID from the open to-dos list in the system prompt.",
+            },
+            "note": {"type": "string", "description": "Optional one-line note; empty string if none."},
+        },
+        "required": ["todo_id", "note"],
+    },
+}
+
 UNCLEAR_TOOL = {
     "name": "unclear",
     "description": "Use ONLY when you genuinely cannot tell what the user wants.",
@@ -188,7 +210,7 @@ UNCLEAR_TOOL = {
     },
 }
 
-ALL_TOOLS = [CREATE_EVENT_TOOL, CREATE_TODO_TOOL, LIST_TODOS_TOOL, UPDATE_EVENT_TOOL, CANCEL_EVENT_TOOL, UNCLEAR_TOOL]
+ALL_TOOLS = [CREATE_EVENT_TOOL, CREATE_TODO_TOOL, LIST_TODOS_TOOL, UPDATE_EVENT_TOOL, CANCEL_EVENT_TOOL, REMOVE_TODO_TOOL, UNCLEAR_TOOL]
 
 
 def pretty_datetime(date_str: str, time_str: str) -> str:
@@ -228,6 +250,16 @@ def parse_message(text: str, chat_id) -> dict:
     else:
         recent_block = "The user has no recent events on file yet (nothing to edit)."
 
+    # Build the numbered list of open to-dos so Claude can target a removal.
+    todos = store.list_todos(chat_id)
+    if todos:
+        tlines = ["The user's open to-dos (use the ID as todo_id when removing one):"]
+        for t in todos:
+            tlines.append(f"  ID {t['id']}: {t['title']}")
+        todo_block = "\n".join(tlines)
+    else:
+        todo_block = "The user has no open to-dos."
+
     system_prompt = (
         "You are JARVIS, a personal scheduling assistant. For each message, call "
         "exactly ONE tool.\n\n"
@@ -236,11 +268,13 @@ def parse_message(text: str, chat_id) -> dict:
         "upcoming matching date as YYYY-MM-DD.\n"
         "A date AND time => create_event. A task with no time => create_todo. A request "
         "to see tasks => list_todos. A request to CHANGE an existing event => update_event. "
-        "A request to DELETE/CANCEL an existing event => cancel_event. "
+        "A request to DELETE/CANCEL an existing event => cancel_event. A request to "
+        "REMOVE/COMPLETE/CHECK OFF a TASK (to-do) => remove_todo. "
         "Use unclear only as a last resort.\n\n"
         "Use the conversation history to understand follow-ups: 'it'/'that'/'the dentist' "
         "usually refer to a recent event below.\n\n"
-        f"{recent_block}"
+        f"{recent_block}\n\n"
+        f"{todo_block}"
     )
 
     # Feed back the rolling conversation so follow-ups have context. We make sure
@@ -421,6 +455,24 @@ def _handle_cancel_event(data: dict, chat_id) -> str:
     return reply
 
 
+def _handle_remove_todo(data: dict, chat_id) -> str:
+    try:
+        tid = int(data.get("todo_id"))
+    except (TypeError, ValueError):
+        return "I wasn't sure which to-do you meant. Try naming it, e.g. 'remove email housing'."
+
+    removed = store.remove_todo(chat_id, tid)
+    if not removed:
+        return "I couldn't find that to-do. Say 'what's on my list' to see them."
+
+    open_count = len(store.list_todos(chat_id))
+    reply = f"Removed from your list: {removed['title']}\nYou now have {open_count} open to-do(s)."
+    note = (data.get("note") or "").strip()
+    if note:
+        reply += f"\n(note: {note})"
+    return reply
+
+
 def _handle_unclear(data: dict, chat_id) -> str:
     read_as = (data.get("read_as") or "").strip()
     note = (data.get("note") or "").strip()
@@ -445,6 +497,8 @@ def act_on_item(parsed: dict, chat_id) -> str:
         return _handle_update_event(data, chat_id)
     if tool == "cancel_event":
         return _handle_cancel_event(data, chat_id)
+    if tool == "remove_todo":
+        return _handle_remove_todo(data, chat_id)
     return _handle_unclear(data, chat_id)
 
 

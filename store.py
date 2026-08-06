@@ -113,6 +113,25 @@ def list_todos(chat_id, include_done: bool = False) -> list:
     return [t for t in todos if not t.get("done", False)]
 
 
+def remove_todo(chat_id, todo_id) -> dict:
+    """Delete one to-do outright by its id. Returns the removed to-do (a dict),
+    or None if no to-do with that id was found."""
+    data = _read_json(TODOS_FILE)
+    key = str(chat_id)
+    todos = data.get(key, [])
+    try:
+        todo_id = int(todo_id)
+    except (TypeError, ValueError):
+        return None
+    for i, t in enumerate(todos):
+        if t.get("id") == todo_id:
+            removed = todos.pop(i)
+            data[key] = todos
+            _write_json(TODOS_FILE, data)
+            return removed
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Memory (part 2): rolling messages + recent editable events
 # ---------------------------------------------------------------------------
@@ -278,6 +297,15 @@ if __name__ == "__main__":
     update_recent_event(TEST, 0, new_time="16:00")
     for i, e in enumerate(get_recent_events(TEST), start=1):
         print(f"  {i}. {e['title']} {e['date']} {e['time']}")
+
+    print("\nTo-dos - removing the first one:")
+    open_todos = list_todos(TEST)
+    if open_todos:
+        gone = remove_todo(TEST, open_todos[0]["id"])
+        print(f"  removed: {gone['title'] if gone else '(nothing)'}")
+        print("  remaining:")
+        for t in list_todos(TEST):
+            print(f"    [{t['id']}] {t['title']}")
 
     print(f"\nFiles:\n  {TODOS_FILE}\n  {MEMORY_FILE}")
     print("Open them in Notepad to see the raw JSON. Delete them for a clean start;")
