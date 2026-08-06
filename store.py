@@ -271,6 +271,41 @@ def clear_last_event(chat_id) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pending events: events read from a calendar screenshot that are waiting for
+# the user to text 'confirm' before we write them to the real calendar. Lives
+# in memory.json so a restart mid-confirmation doesn't lose them.
+# ---------------------------------------------------------------------------
+def set_pending_events(chat_id, events: list) -> None:
+    """Stash a list of parsed-but-not-yet-written events for this chat."""
+    data = _read_json(MEMORY_FILE)
+    key = str(chat_id)
+    entry = data.get(key, _blank_memory())
+    entry.setdefault("messages", [])
+    entry.setdefault("recent_events", [])
+    entry["pending_events"] = events
+    data[key] = entry
+    _write_json(MEMORY_FILE, data)
+
+
+def get_pending_events(chat_id) -> list:
+    """Return the events awaiting confirmation (empty list if none)."""
+    entry = _read_json(MEMORY_FILE).get(str(chat_id), {})
+    return entry.get("pending_events", []) or []
+
+
+def clear_pending_events(chat_id) -> None:
+    """Forget the pending events (after they're confirmed or discarded)."""
+    data = _read_json(MEMORY_FILE)
+    key = str(chat_id)
+    entry = data.get(key)
+    if not entry:
+        return
+    entry["pending_events"] = []
+    data[key] = entry
+    _write_json(MEMORY_FILE, data)
+
+
+# ---------------------------------------------------------------------------
 # Smoke test: run `py store.py` to exercise BOTH stores without the bot.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

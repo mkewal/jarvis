@@ -18,6 +18,7 @@ What changed from Milestone 3:
 import os
 import sys
 import time
+import base64
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -61,8 +62,18 @@ claude = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 
 MY_TZ = ZoneInfo("America/New_York")
 MODEL = "claude-haiku-4-5-20251001"
+# Reading events off a screenshot needs sharper vision than the everyday text
+# path, so the image path uses a stronger (pricier) model. It runs rarely, so
+# the extra cost is negligible; normal texts stay on the cheap/fast Haiku.
+VISION_MODEL = "claude-sonnet-4-6"
 
 UNDO_WORDS = {"undo", "undo that", "delete that", "cancel that", "remove that", "nvm"}
+
+# Short replies that confirm or discard events parsed from a screenshot. These
+# are only checked when there ARE pending events, so they don't hijack normal
+# messages (e.g. 'cancel my 3pm' still routes to cancel_event).
+CONFIRM_WORDS = {"confirm", "yes", "yep", "yeah", "add them", "add all", "add", "looks good", "ok", "okay", "do it"}
+CANCEL_PENDING_WORDS = {"cancel", "no", "discard", "nvm", "nevermind", "never mind", "nope"}
 
 
 def is_authorized(chat_id) -> bool:
@@ -211,6 +222,34 @@ UNCLEAR_TOOL = {
 }
 
 ALL_TOOLS = [CREATE_EVENT_TOOL, CREATE_TODO_TOOL, LIST_TODOS_TOOL, UPDATE_EVENT_TOOL, CANCEL_EVENT_TOOL, REMOVE_TODO_TOOL, UNCLEAR_TOOL]
+
+# The image path uses its OWN tool: one call returns a LIST of events, since a
+# calendar screenshot usually has several. (The text path forces exactly one
+# tool per message; images are different, so they get a separate tool + model.)
+EXTRACT_EVENTS_TOOL = {
+    "name": "extract_calendar_events",
+    "description": "Return every calendar event you can read from the image.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "events": {
+                "type": "array",
+                "description": "All events found in the image. Empty list if none are legible.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Short clean event title."},
+                        "date": {"type": "string", "description": "Absolute date as YYYY-MM-DD."},
+                        "time": {"type": "string", "description": "Start time as 24-hour HH:MM."},
+                        "note": {"type": "string", "description": "Optional detail like location; empty string if none."},
+                    },
+                    "required": ["title", "date", "time", "note"],
+                },
+            }
+        },
+        "required": ["events"],
+    },
+}
 
 
 def pretty_datetime(date_str: str, time_str: str) -> str:
@@ -552,6 +591,126 @@ def send_morning_brief():
 
 
 # ---------------------------------------------------------------------------
+# 3c. Calendar screenshots: read events off an image, confirm, then write
+# ---------------------------------------------------------------------------
+def extract_events_from_image(image_bytes: bytes, media_type: str) -> list:
+    """Send an image to Claude (vision) and get back a list of events it read.
+
+    Each event is {'title','date','time','note'}. Empty list if none legible.
+    Uses the stronger VISION_MODEL because reading small calendar text matters.
+    """
+    now = datetime.now(MY_TZ)
+    today_context = now.strftime("%A, %B %d, %Y")
+    b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+
+    system_prompt = (
+        "You read calendar screenshots and pull out the events. "
+        f"The current date is {today_context}, timezone America/New_York (Eastern). "
+        "Extract EVERY event that has both a clear date and a start time. Give each a short "
+        "clean title, an absolute date (YYYY-MM-DD), and a 24-hour start time (HH:MM). "
+        "If the year is not shown, assume the nearest FUTURE occurrence relative to the "
+        "current date. Ignore all-day items or anything where you cannot read a specific "
+        "start time. If you cannot read any events, return an empty list. "
+        "Call extract_calendar_events exactly once."
+    )
+
+    response = claude.messages.create(
+        model=VISION_MODEL,
+        max_tokens=1500,
+        system=system_prompt,
+        tools=[EXTRACT_EVENTS_TOOL],
+        tool_choice={"type": "tool", "name": "extract_calendar_events"},
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                {"type": "text", "text": "Extract all calendar events from this image."},
+            ],
+        }],
+    )
+    for block in response.content:
+        if block.type == "tool_use":
+            return block.input.get("events", []) or []
+    return []
+
+
+def _image_from_message(message: dict):
+    """If the message carries an image, return (file_id, media_type); else (None, None).
+
+    Telegram sends a normal photo as message['photo'] (a list of sizes, largest last)
+    and a file/attachment as message['document']. Sending as a document keeps the
+    original quality (no compression), which reads better."""
+    if message.get("photo"):
+        return message["photo"][-1]["file_id"], "image/jpeg"
+    doc = message.get("document")
+    if doc and str(doc.get("mime_type", "")).startswith("image/"):
+        return doc["file_id"], doc["mime_type"]
+    return None, None
+
+
+def handle_image(message: dict, chat_id) -> str:
+    """Download the image, read events off it, and stage them for confirmation."""
+    file_id, media_type = _image_from_message(message)
+    try:
+        path = get_file_path(file_id)
+        image_bytes = download_file(path)
+    except Exception as e:
+        print("   IMAGE DOWNLOAD ERROR:", e)
+        return "I couldn't download that image from Telegram. Try sending it again."
+
+    try:
+        events = extract_events_from_image(image_bytes, media_type)
+    except Exception as e:
+        print("   VISION ERROR:", e)
+        return f"I couldn't read that image: {e}"
+
+    # Keep only well-formed events (must have both a date and a time).
+    events = [e for e in events if (e.get("date") and e.get("time"))]
+    if not events:
+        return ("I looked but couldn't pull any dated, timed events out of that image. "
+                "If it's a calendar, try sending it as a FILE (not a compressed photo) so "
+                "the text stays sharp.")
+
+    store.set_pending_events(chat_id, events)
+    lines = [f"I read {len(events)} event(s) from that image:"]
+    for i, e in enumerate(events, start=1):
+        lines.append(f"  {i}. {e['title']} - {pretty_datetime(e['date'], e['time'])}")
+    lines.append("")
+    lines.append("Reply 'confirm' to add them all to your calendar, or 'cancel' to discard.")
+    return "\n".join(lines)
+
+
+def create_pending_events(chat_id) -> str:
+    """Write the confirmed events to the calendar and report back."""
+    events = store.get_pending_events(chat_id)
+    if not events:
+        return "Nothing waiting to confirm."
+
+    created, failed = [], []
+    for e in events:
+        try:
+            result = create_event(e["title"], e["date"], e["time"])
+            store.add_recent_event(chat_id, result["id"], e["title"], e["date"], e["time"])
+            store.set_last_event(chat_id, result["id"], e["title"])
+            created.append((e["title"], result["confirmed_when"]))
+        except Exception as ex:
+            print("   PENDING CREATE ERROR:", ex)
+            failed.append(e.get("title", "(untitled)"))
+
+    store.clear_pending_events(chat_id)
+
+    lines = [f"Added {len(created)} event(s) to your calendar:"]
+    for title, when in created:
+        lines.append(f"- {title} - {when}")
+    if failed:
+        lines.append("")
+        lines.append("Couldn't add: " + ", ".join(failed))
+    lines.append("")
+    lines.append("Wrong last one? Reply 'undo'. Or delete any by name, e.g. 'delete the standup'.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # 4. Telegram plumbing (unchanged)
 # ---------------------------------------------------------------------------
 def get_updates(offset=None):
@@ -562,6 +721,20 @@ def get_updates(offset=None):
 
 def send_message(chat_id, text):
     requests.post(f"{API}/sendMessage", data={"chat_id": chat_id, "text": text})
+
+
+def get_file_path(file_id: str) -> str:
+    """Ask Telegram where a file (by id) lives, so we can download it."""
+    r = requests.get(f"{API}/getFile", params={"file_id": file_id}, timeout=30)
+    return r.json()["result"]["file_path"]
+
+
+def download_file(file_path: str) -> bytes:
+    """Download a Telegram file's raw bytes (used for calendar screenshots)."""
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
 
 
 # ---------------------------------------------------------------------------
@@ -604,12 +777,10 @@ def main():
             for update in get_updates(offset):
                 offset = update["update_id"] + 1
                 message = update.get("message")
-                if not message or "text" not in message:
+                if not message:
                     continue
 
                 chat_id = message["chat"]["id"]
-                text = message["text"]
-                print(f"Received from chat_id {chat_id}: {text}")
 
                 # Security gate: ignore anyone who isn't you. No reply, no
                 # calendar write, nothing saved to memory.
@@ -617,10 +788,37 @@ def main():
                     print(f"   IGNORED - chat_id {chat_id} is not authorized. No reply sent.")
                     continue
 
+                # ---- Image path: a calendar screenshot to parse ----
+                file_id, _media = _image_from_message(message)
+                if file_id:
+                    print(f"Received an image from chat_id {chat_id}")
+                    try:
+                        reply = handle_image(message, chat_id)
+                    except Exception as e:
+                        reply = f"My brain hit an error on that image: {e}"
+                        print("   IMAGE ERROR:", e)
+                    send_message(chat_id, reply)
+                    store.append_message(chat_id, "user", "[sent a calendar screenshot]")
+                    store.append_message(chat_id, "assistant", reply)
+                    continue
+
+                if "text" not in message:
+                    continue
+                text = message["text"]
+                print(f"Received from chat_id {chat_id}: {text}")
+
+                low = text.strip().lower()
+                pending = store.get_pending_events(chat_id)
+
                 # Decide the reply (a few commands are handled without Claude).
-                if text.strip().lower() in BRIEF_WORDS:
+                if pending and low in CONFIRM_WORDS:
+                    reply = create_pending_events(chat_id)
+                elif pending and low in CANCEL_PENDING_WORDS:
+                    store.clear_pending_events(chat_id)
+                    reply = "Discarded those - nothing was added to your calendar."
+                elif low in BRIEF_WORDS:
                     reply = build_brief(chat_id)
-                elif text.strip().lower() in UNDO_WORDS:
+                elif low in UNDO_WORDS:
                     last = store.get_last_event(chat_id)
                     if last:
                         try:
@@ -666,5 +864,17 @@ if __name__ == "__main__":
     # test the unattended 9am path without waiting until 9am.
     if len(sys.argv) > 1 and sys.argv[1] == "testbrief":
         send_morning_brief()
+    elif len(sys.argv) > 2 and sys.argv[1] == "testimage":
+        # `py jarvis.py testimage path\to\screenshot.png` reads events off a
+        # local image and prints them - verifies the vision path WITHOUT
+        # touching Telegram (so no conflict with the live Railway poller).
+        img_path = sys.argv[2]
+        with open(img_path, "rb") as f:
+            img = f.read()
+        mt = "image/png" if img_path.lower().endswith(".png") else "image/jpeg"
+        found = extract_events_from_image(img, mt)
+        print(f"Extracted {len(found)} event(s):")
+        for ev in found:
+            print(f"  - {ev.get('title')} | {ev.get('date')} {ev.get('time')} | note: {ev.get('note')}")
     else:
         main()
